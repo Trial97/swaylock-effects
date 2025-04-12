@@ -2,7 +2,7 @@ swaylock(1)
 
 # NAME
 
-swaylock - Screen locker for Wayland
+swaylock-effects - Fancier screen locker for Wayland
 
 # SYNOPSIS
 
@@ -42,6 +42,25 @@ Locks your Wayland session.
 	At this point, the compositor guarantees that no security sensitive content
 	is visible on-screen.
 
+*--fade-in* <seconds>
+	Fade in the lock screen.
+
+*--submit-on-touch*
+	Submit password in response to a touch event.
+
+*--grace* <seconds>
+	Only require a password after some grace period.
+
+	Note: Together with *--indicator*, the indicator is always shown.
+	Together with *--indicator-idle-visible*, the indicator is only shown
+	after the grace period.
+
+*--grace-no-mouse*
+	With *--grace*, don't unlock in response to a mouse event.
+
+*--grace-no-touch*
+	With *--grace*, don't unlock in response to a touch event.
+
 *-h, --help*
 	Show help message and quit.
 
@@ -53,10 +72,25 @@ Locks your Wayland session.
 *-u, --no-unlock-indicator*
 	Disable the unlock indicator.
 
+*--indicator*
+	Always show the indicator.
+
+*--clock*
+	Show a clock in the indicator.
+
+*--timestr* <format>
+	The time format for the indicator clock. Defaults to '%T'.
+
+*--datestr* <format>
+	The date format for the indicator clock. Defaults to '%a, %x'.
+
 *-i, --image* [[<output>]:]<path>
 	Display the given image, optionally only on the given output. Use -c to set
 	a background color. If the path potentially contains a ':', prefix it with another
 	':' to prevent interpreting part of it as <output>.
+
+*-S, --screenshots*
+	Display a screenshot.
 
 *-k, --show-keyboard-layout*
 	Display the current xkb layout while typing.
@@ -76,7 +110,7 @@ Locks your Wayland session.
 	_solid\_color_. Use _solid\_color_ to display only the background color, even
 	if a background image is specified.
 
-*-t, --tiling*
+*-T, --tiling*
 	Same as --scaling=tile.
 
 *-c, --color* <rrggbb[aa]>
@@ -113,6 +147,9 @@ Locks your Wayland session.
 
 *--indicator-y-position* <y>
 	Sets the vertical position of the indicator.
+
+*--indicator-image* <path>
+	Display the given image inside of the indicator.
 
 *--inside-color* <rrggbb[aa]>
 	Sets the color of the inside of the indicator.
@@ -184,17 +221,58 @@ Locks your Wayland session.
 *--text-color* <rrggbb[aa]>
 	Sets the color of the text.
 
+*--text-clear* <string>
+	Sets the string displayed when the password is cleared.
+
 *--text-clear-color* <rrggbb[aa]>
 	Sets the color of the text when cleared.
+
+*--text-caps-lock* <string>
+	Sets the string displayed when Caps Lock is active.
 
 *--text-caps-lock-color* <rrggbb[aa]>
 	Sets the color of the text when Caps Lock is active.
 
+*--text-ver* <string>
+	Sets the string displayed when the password is being verified.
+
 *--text-ver-color* <rrggbb[aa]>
 	Sets the color of the text when verifying.
 
+*--text-wrong* <string>
+	Sets the string displayed when the password is wrong.
+
 *--text-wrong-color* <rrggbb[aa]>
 	Sets the color of the text when invalid.
+
+*--effect-blur* <radius>x<times>
+	Blur displayed images.
+
+*--effect-pixelate* <factor>
+	Pixelate displayed images.
+
+*--effect-scale* <scale>
+	Scale the image by a factor. This can be used to
+	make other effects faster if you don't need the full resolution.
+
+*--effect-greyscale*
+	Make the displayed image greyscale.
+
+*--effect-vignette <base>:<factor>*
+	Apply a vignette effect to images.
+	Base and factor should be numbers between 0 and 1.
+
+*--effect-compose <position>;<size>;<gravity>;<path>*
+	Overlay another image to your lock screen.
+	The _position_, _size_ and _gravity_ part is optional.
+
+*--effect-custom <path>*
+	Load a custom effect from a shared object. The .so must export a++
+*void swaylock_effect(uint32\_t \*data, int width, int height, int scale)*++
+or an *uint32\_t swaylock_pixel(uint32\_t pix, int x, int y, int width, int height)*.
+
+*--time-effects*
+	Measure the time it takes to run each effect.
 
 # SIGNALS
 
@@ -203,6 +281,7 @@ Locks your Wayland session.
 
 # AUTHORS
 
-Maintained by Drew DeVault <sir@cmpwn.com>, who is assisted by other open
-source contributors. For more information about swaylock development, see
-https://github.com/swaywm/swaylock.
+Maintained by Jakub Jirutka. This is a fork of the upstream Swaylock, which is
+maintained by Simon Ser, and it was originally forked by Martin Dørum.
+For more information about swaylock-effects development, see
+https://github.com/jirutka/swaylock-effects.

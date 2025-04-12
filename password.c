@@ -134,8 +134,28 @@ static void update_highlight(struct swaylock_state *state) {
 		(state->highlight_start + (rand() % 1024) + 512) % 2048;
 }
 
+void swaylock_handle_mouse(struct swaylock_state *state) {
+	if (state->auth_state == AUTH_STATE_GRACE && !state->args.password_grace_no_mouse) {
+		state->run_display = false;
+	}
+}
+
+void swaylock_handle_touch(struct swaylock_state *state) {
+	if (state->auth_state == AUTH_STATE_GRACE && !state->args.password_grace_no_touch) {
+		state->run_display = false;
+	} else if (state->auth_state != AUTH_STATE_VALIDATING && state->args.password_submit_on_touch) {
+		submit_password(state);
+	}
+}
+
 void swaylock_handle_key(struct swaylock_state *state,
 		xkb_keysym_t keysym, uint32_t codepoint) {
+	// Authentication not needed
+	if (state->auth_state == AUTH_STATE_GRACE) {
+		state->run_display = false;
+		return;
+	}
+	
 
 	switch (keysym) {
 	case XKB_KEY_KP_Enter: /* fallthrough */

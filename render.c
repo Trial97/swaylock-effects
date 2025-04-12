@@ -1,10 +1,18 @@
 #include <math.h>
 #include <stdlib.h>
+#include <time.h>
+#include <locale.h>
 #include <wayland-client.h>
 #include "cairo.h"
 #include "background-image.h"
 #include "swaylock.h"
 #include "log.h"
+
+// glib might or might not have already defined MIN,
+// depending on whether we have pixbuf or not...
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
 
 #define M_PI 3.14159265358979323846
 const float TYPE_INDICATOR_RANGE = M_PI / 3.0f;
@@ -49,6 +57,35 @@ static const struct wl_callback_listener surface_frame_listener = {
 
 static bool render_frame(struct swaylock_surface *surface);
 
+static void timetext(struct swaylock_surface *surface, char **tstr, char **dstr) {
+    static char dbuf[256];
+    static char tbuf[256];
+
+    // Use user's locale for strftime calls
+    char *prevloc = setlocale(LC_TIME, NULL);
+    setlocale(LC_TIME, "");
+
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+
+    if (surface->state->args.timestr[0]) {
+        strftime(tbuf, sizeof(tbuf), surface->state->args.timestr, tm);
+        *tstr = tbuf;
+    } else {
+        *tstr = NULL;
+    }
+
+    if (surface->state->args.datestr[0]) {
+        strftime(dbuf, sizeof(dbuf), surface->state->args.datestr, tm);
+        *dstr = dbuf;
+    } else {
+        *dstr = NULL;
+    }
+
+    // Set it back, so we don't break stuff
+    setlocale(LC_TIME, prevloc);
+}
+
 void render(struct swaylock_surface *surface) {
 	struct swaylock_state *state = surface->state;
 
@@ -82,11 +119,31 @@ void render(struct swaylock_surface *surface) {
 		cairo_save(cairo);
 		cairo_set_operator(cairo, CAIRO_OPERATOR_SOURCE);
 		cairo_set_source_u32(cairo, state->args.colors.background);
-		cairo_paint(cairo);
+	    cairo_pattern_set_filter(cairo_get_source(cairo), CAIRO_FILTER_BILINEAR);
+        cairo_paint(cairo);
 		if (surface->image && state->args.mode != BACKGROUND_MODE_SOLID_COLOR) {
 			cairo_set_operator(cairo, CAIRO_OPERATOR_OVER);
-			render_background_image(cairo, surface->image,
-				state->args.mode, buffer_width, buffer_height);
+            if (fade_is_complete(&surface->fade)) {
+                if (!surface->scaled_image) {
+                    surface->scaled_image =
+                        scale_background_image(surface->image, state->args.mode,
+                            buffer_width, buffer_height);
+                }
+                render_background_image(cairo, surface->scaled_image, 1);
+            } else {
+                if (!surface->screencopy.scaled_image) {
+                    surface->screencopy.scaled_image =
+                        scale_background_image(surface->screencopy.original_image,
+                             state->args.mode, buffer_width, buffer_height);
+                }
+                render_background_image(cairo, surface->screencopy.scaled_image, 1);
+                if (!surface->scaled_image) {
+                    surface->scaled_image =
+                        scale_background_image(surface->image, state->args.mode,
+                            buffer_width, buffer_height);
+                }
+                render_background_image(cairo, surface->scaled_image, surface->fade.alpha);
+            }
 		}
 		cairo_restore(cairo);
 		cairo_identity_matrix(cairo);
@@ -104,11 +161,24 @@ void render(struct swaylock_surface *surface) {
 	surface->dirty = false;
 	surface->frame = wl_surface_frame(surface->surface);
 	wl_callback_add_listener(surface->frame, &surface_frame_listener, surface);
-	wl_surface_commit(surface->surface);
+	if (commit) {
+        wl_surface_commit(surface->surface);
+	}
 
 	if (need_destroy) {
 		destroy_buffer(&buffer);
 	}
+}
+
+void render_background_fade(struct swaylock_surface *surface, uint32_t time) {
+	if (fade_is_complete(&surface->fade)) {
+		return;
+	}
+
+	fade_update(&surface->fade, time);
+
+	render_frame_background(surface, true);
+	render_frame(surface);
 }
 
 static void configure_font_drawing(cairo_t *cairo, struct swaylock_state *state,
@@ -137,7 +207,10 @@ static bool render_frame(struct swaylock_surface *surface) {
 
 	char attempts[4]; // like i3lock: count no more than 999
 	char *text = NULL;
+    char *text_l1 = NULL;
+    char *text_l2 = NULL;
 	const char *layout_text = NULL;
+    double font_size;
 
 	bool draw_indicator = state->args.show_indicator &&
 		(state->auth_state != AUTH_STATE_IDLE ||
@@ -147,15 +220,15 @@ static bool render_frame(struct swaylock_surface *surface) {
 	if (draw_indicator) {
 		if (state->input_state == INPUT_STATE_CLEAR) {
 			// This message has highest priority
-			text = "Cleared";
+			text = state->args.text_cleared;
 		} else if (state->auth_state == AUTH_STATE_VALIDATING) {
-			text = "Verifying";
+			text = state->args.text_verifyin;
 		} else if (state->auth_state == AUTH_STATE_INVALID) {
-			text = "Wrong";
+			text = state->args.text_wrong;
 		} else {
 			// Caps Lock has higher priority
 			if (state->xkb.caps_lock && state->args.show_caps_lock_text) {
-				text = "Caps Lock";
+				text = state->args.text_caps_lock;
 			} else if (state->args.show_failed_attempts &&
 					state->failed_attempts > 0) {
 				if (state->failed_attempts > 999) {
@@ -164,6 +237,8 @@ static bool render_frame(struct swaylock_surface *surface) {
 					snprintf(attempts, sizeof(attempts), "%d", state->failed_attempts);
 					text = attempts;
 				}
+            } else if (state->args.clock) {
+                timetext(surface, &text_l1, &text_l2);
 			}
 
 			if (state->xkb.keymap) {
@@ -184,6 +259,11 @@ static bool render_frame(struct swaylock_surface *surface) {
 			}
 		}
 	}
+
+    if (text_l1 && !text_l2)
+        text = text_l1;
+    if (text_l2 && !text_l1)
+        text = text_l2;
 
 	// Compute the size of the buffer needed
 	int arc_radius = state->args.radius * surface->scale;
@@ -214,6 +294,47 @@ static bool render_frame(struct swaylock_surface *surface) {
 				buffer_width = extents.width + 2 * box_padding;
 			}
 		}
+    } else if (text_l1 && text_l2) {
+        cairo_text_extents_t extents_l1, extents_l2;
+        cairo_font_extents_t fe_l1, fe_l2;
+        double x_l1, y_l1, x_l2, y_l2;
+
+        /* Top */
+
+        cairo_text_extents(cairo, text_l1, &extents_l1);
+        cairo_font_extents(cairo, &fe_l1);
+        x_l1 = (buffer_width / 2) -
+            (extents_l1.width / 2 + extents_l1.x_bearing);
+        y_l1 = (buffer_diameter / 2) +
+            (fe_l1.height / 2 - fe_l1.descent) - arc_radius / 10.0f;
+
+        cairo_move_to(cairo, x_l1, y_l1);
+        cairo_show_text(cairo, text_l1);
+        cairo_close_path(cairo);
+        cairo_new_sub_path(cairo);
+
+        /* Bottom */
+
+        cairo_set_font_size(cairo, arc_radius / 6.0f);
+        cairo_text_extents(cairo, text_l2, &extents_l2);
+        cairo_font_extents(cairo, &fe_l2);
+        x_l2 = (buffer_width / 2) -
+            (extents_l2.width / 2 + extents_l2.x_bearing);
+        y_l2 = (buffer_diameter / 2) +
+            (fe_l2.height / 2 - fe_l2.descent) + arc_radius / 3.5f;
+
+        cairo_move_to(cairo, x_l2, y_l2);
+        cairo_show_text(cairo, text_l2);
+        cairo_close_path(cairo);
+        cairo_new_sub_path(cairo);
+
+        if (new_width < extents_l1.width)
+            new_width = extents_l1.width;
+        if (new_width < extents_l2.width)
+            new_width = extents_l2.width;
+
+
+        cairo_set_font_size(cairo, font_size);
 	}
 	// Ensure buffer size is multiple of buffer scale - required by protocol
 	buffer_height += surface->scale - (buffer_height % surface->scale);
@@ -281,6 +402,11 @@ static bool render_frame(struct swaylock_surface *surface) {
 		// Draw a message
 		configure_font_drawing(cairo, state, surface->subpixel, arc_radius);
 		set_color_for_state(cairo, state, &state->args.colors.text);
+
+		if (text_l1 && !text_l2)
+			text = text_l1;
+		if (text_l2 && !text_l1)
+			text = text_l2;
 
 		if (text) {
 			cairo_text_extents_t extents;

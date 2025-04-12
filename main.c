@@ -24,7 +24,29 @@
 #include "pool-buffer.h"
 #include "seat.h"
 #include "swaylock.h"
+#include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "ext-session-lock-v1-client-protocol.h"
+
+// returns a positive integer in milliseconds
+static uint32_t parse_seconds(const char *seconds) {
+	char *endptr;
+	errno = 0;
+	float val = strtof(seconds, &endptr);
+	if (errno != 0) {
+		swaylock_log(LOG_DEBUG, "Invalid number for seconds %s, defaulting to 0", seconds);
+		return 0;
+	}
+	if (endptr == seconds) {
+		swaylock_log(LOG_DEBUG, "No digits were found in %s, defaulting to 0", seconds);
+		return 0;
+	}
+	if (val < 0) {
+		swaylock_log(LOG_DEBUG, "Negative seconds not allowed for %s, defaulting to 0", seconds);
+		return 0;
+	}
+
+	return (uint32_t)floor(val * 1000);
+}
 
 static uint32_t parse_color(const char *color) {
 	if (color[0] == '#') {
@@ -44,6 +66,118 @@ static uint32_t parse_color(const char *color) {
 	return res;
 }
 
+static const char *parse_screen_pos(const char *str, struct swaylock_effect_screen_pos *pos) {
+	char *eptr;
+	float res = strtof(str, &eptr);
+	if (eptr == str)
+		return NULL;
+
+	pos->pos = res;
+	if (eptr[0] == '%') {
+		pos->is_percent = true;
+		return eptr + 1;
+	} else {
+		pos->is_percent = false;
+		return eptr;
+	}
+}
+
+static const char *parse_screen_pos_pair(const char *str, char delim,
+		struct swaylock_effect_screen_pos *pos1,
+		struct swaylock_effect_screen_pos *pos2) {
+	struct swaylock_effect_screen_pos tpos1, tpos2;
+	str = parse_screen_pos(str, &tpos1);
+	if (str == NULL || str[0] != delim)
+		return NULL;
+
+	str = parse_screen_pos(str + 1, &tpos2);
+	if (str == NULL)
+		return NULL;
+
+	pos1->pos = tpos1.pos;
+	pos1->is_percent = tpos1.is_percent;
+	pos2->pos = tpos2.pos;
+	pos2->is_percent = tpos2.is_percent;
+	return str;
+}
+
+static const char *parse_constant(const char *str1, const char *str2) {
+	size_t len = strlen(str2);
+	if (strncmp(str1, str2, len) == 0) {
+		return str1 + len;
+	} else {
+		return NULL;
+	}
+}
+
+static int parse_gravity_from_xy(float x, float y) {
+	if (x >= 0 && y >= 0)
+		return EFFECT_COMPOSE_GRAV_NW;
+	else if (x >= 0 && y < 0)
+		return EFFECT_COMPOSE_GRAV_SW;
+	else if (x < 0 && y >= 0)
+		return EFFECT_COMPOSE_GRAV_NE;
+	else
+		return EFFECT_COMPOSE_GRAV_SE;
+}
+
+static void parse_effect_compose(const char *str, struct swaylock_effect *effect) {
+	effect->e.compose.x = effect->e.compose.y = (struct swaylock_effect_screen_pos) { 50, 1 }; // 50%
+	effect->e.compose.w = effect->e.compose.h = (struct swaylock_effect_screen_pos) { -1, 0 }; // -1
+	effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_CENTER;
+	effect->e.compose.imgpath = NULL;
+
+	// Parse position if they exist
+	const char *s = parse_screen_pos_pair(str, ',', &effect->e.compose.x, &effect->e.compose.y);
+	if (s == NULL) {
+		s = str;
+	} else {
+		// If we're given an x/y position, determine gravity automatically
+		// from whether x and y is positive or not
+		effect->e.compose.gravity = parse_gravity_from_xy(
+				effect->e.compose.x.pos, effect->e.compose.y.pos);
+		s += 1;
+		str = s;
+	}
+
+	// Parse dimensions if they exist
+	s = parse_screen_pos_pair(str, 'x', &effect->e.compose.w, &effect->e.compose.h);
+	if (s == NULL) {
+		s = str;
+	} else {
+		s += 1;
+		str = s;
+	}
+
+	// Parse gravity if it exists
+	if ((s = parse_constant(str, "center;")) != NULL)
+		effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_CENTER;
+	else if ((s = parse_constant(str, "northwest;")) != NULL)
+		effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_NW;
+	else if ((s = parse_constant(str, "northeast;")) != NULL)
+		effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_NE;
+	else if ((s = parse_constant(str, "southwest;")) != NULL)
+		effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_SW;
+	else if ((s = parse_constant(str, "southeast;")) != NULL)
+		effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_SE;
+	else if ((s = parse_constant(str, "north;")) != NULL)
+		effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_N;
+	else if ((s = parse_constant(str, "south;")) != NULL)
+		effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_S;
+	else if ((s = parse_constant(str, "east;")) != NULL)
+		effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_E;
+	else if ((s = parse_constant(str, "west;")) != NULL)
+		effect->e.compose.gravity = EFFECT_COMPOSE_GRAV_W;
+	if (s == NULL) {
+		s = str;
+	} else {
+		str = s;
+	}
+
+	// The rest is the file name
+	effect->e.compose.imgpath = strdup(str);
+}
+
 int lenient_strcmp(char *a, char *b) {
 	if (a == b) {
 		return 0;
@@ -56,7 +190,8 @@ int lenient_strcmp(char *a, char *b) {
 	}
 }
 
-static void daemonize(void) {
+static int daemonize_start() {
+	swaylock_trace();
 	int fds[2];
 	if (pipe(fds) != 0) {
 		swaylock_log(LOG_ERROR, "Failed to pipe");
@@ -74,11 +209,7 @@ static void daemonize(void) {
 			write(fds[1], &success, 1);
 			exit(1);
 		}
-		success = 1;
-		if (write(fds[1], &success, 1) != 1) {
-			exit(1);
-		}
-		close(fds[1]);
+		return fds[1];
 	} else {
 		close(fds[1]);
 		uint8_t success;
@@ -91,7 +222,25 @@ static void daemonize(void) {
 	}
 }
 
+static void daemonize_done(void *fdptr) {
+	swaylock_trace();
+	int *fd = (int *)fdptr;
+	if (*fd < 0) {
+		return;
+	}
+
+	uint8_t success = 1;
+	if (write(*fd, &success, 1) != 1) {
+		swaylock_log(LOG_ERROR, "Failed to tell parent process that daemonization is done");
+		exit(1);
+	}
+	close(*fd);
+	*fd = -1;
+}
+
 static void destroy_surface(struct swaylock_surface *surface) {
+	swaylock_log(LOG_DEBUG, "Destroy surface for output %s", surface->output_name);
+
 	wl_list_remove(&surface->link);
 	if (surface->ext_session_lock_surface_v1 != NULL) {
 		ext_session_lock_surface_v1_destroy(surface->ext_session_lock_surface_v1);
@@ -117,6 +266,9 @@ static cairo_surface_t *select_image(struct swaylock_state *state,
 		struct swaylock_surface *surface);
 
 static bool surface_is_opaque(struct swaylock_surface *surface) {
+	if (!fade_is_complete(&surface->fade)) {
+		return false;
+	}
 	if (surface->image) {
 		return cairo_surface_get_content(surface->image) == CAIRO_CONTENT_COLOR;
 	}
@@ -125,6 +277,10 @@ static bool surface_is_opaque(struct swaylock_surface *surface) {
 
 static void create_surface(struct swaylock_surface *surface) {
 	struct swaylock_state *state = surface->state;
+
+	if (state->args.allow_fade && state->args.fade_in) {
+		surface->fade.target_time = state->args.fade_in;
+	}
 
 	surface->image = select_image(state, surface);
 
@@ -141,7 +297,16 @@ static void create_surface(struct swaylock_surface *surface) {
 		state->ext_session_lock_v1, surface->surface, surface->output);
 	ext_session_lock_surface_v1_add_listener(surface->ext_session_lock_surface_v1,
 		&ext_session_lock_surface_v1_listener, surface);
+    surface->events_pending += 1;
 
+
+	if (!state->ext_session_lock_v1) {
+		wl_surface_commit(surface->surface);
+	}
+}
+
+static void initially_render_surface(struct swaylock_surface *surface) {
+	swaylock_log(LOG_DEBUG, "Surface for output %s ready", surface->output_name);
 	if (surface_is_opaque(surface) &&
 			surface->state->args.mode != BACKGROUND_MODE_CENTER &&
 			surface->state->args.mode != BACKGROUND_MODE_FIT) {
@@ -153,15 +318,23 @@ static void create_surface(struct swaylock_surface *surface) {
 	}
 
 	surface->created = true;
+    if (!surface->state->ext_session_lock_v1) {
+        render_frame_background(surface, true);
+		render_frame(surface);
+	}
 }
-
 static void ext_session_lock_surface_v1_handle_configure(void *data,
 		struct ext_session_lock_surface_v1 *lock_surface, uint32_t serial,
 		uint32_t width, uint32_t height) {
 	struct swaylock_surface *surface = data;
 	surface->width = width;
 	surface->height = height;
+    // Render before we send the ACK event, so that we minimize flickering
+	// This means we cannot commit immediately after rendering -- we will have
+	// to send the ACK first and then commit.
+	render_frame_background(surface, false);
 	ext_session_lock_surface_v1_ack_configure(lock_surface, serial);
+	wl_surface_commit(surface->surface);
 	surface->dirty = true;
 	render(surface);
 }
@@ -182,8 +355,10 @@ static void handle_wl_output_geometry(void *data, struct wl_output *wl_output,
 		int32_t x, int32_t y, int32_t width_mm, int32_t height_mm,
 		int32_t subpixel, const char *make, const char *model,
 		int32_t transform) {
+	swaylock_trace();
 	struct swaylock_surface *surface = data;
 	surface->subpixel = subpixel;
+	surface->transform = transform;
 	if (surface->state->run_display) {
 		surface->dirty = true;
 		render(surface);
@@ -196,14 +371,36 @@ static void handle_wl_output_mode(void *data, struct wl_output *output,
 }
 
 static void handle_wl_output_done(void *data, struct wl_output *output) {
+	swaylock_trace();
 	struct swaylock_surface *surface = data;
+
 	if (!surface->created && surface->state->run_display) {
 		create_surface(surface);
 	}
+
+	struct swaylock_state *state = surface->state;
+
+	static bool has_printed_screencopy_error = false;
+	if (state->screencopy_manager) {
+		surface->screencopy_frame = zwlr_screencopy_manager_v1_capture_output(
+				state->screencopy_manager, false, surface->output);
+		zwlr_screencopy_frame_v1_add_listener(surface->screencopy_frame,
+				&screencopy_frame_listener, surface);
+		surface->events_pending += 1;
+	} else if (!has_printed_screencopy_error) {
+		swaylock_log(LOG_INFO, "Compositor does not support screencopy manager, "
+				"screenshots / fade-in will not work");
+		state->args.screenshots = false;
+		state->args.fade_in = 0; // Fade in is not possible without screenshot
+		has_printed_screencopy_error = true;
+	}
+
+	--surface->events_pending;
 }
 
 static void handle_wl_output_scale(void *data, struct wl_output *output,
 		int32_t factor) {
+	swaylock_trace();
 	struct swaylock_surface *surface = data;
 	surface->scale = factor;
 	if (surface->state->run_display) {
@@ -212,8 +409,188 @@ static void handle_wl_output_scale(void *data, struct wl_output *output,
 	}
 }
 
+static struct wl_buffer *create_shm_buffer(struct wl_shm *shm, enum wl_shm_format fmt,
+		int width, int height, int stride, void **data_out) {
+	int size = stride * height;
+
+	const char shm_name[] = "/swaylock-shm";
+	int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+	if (fd < 0) {
+		fprintf(stderr, "shm_open failed\n");
+		return NULL;
+	}
+	shm_unlink(shm_name);
+
+	int ret;
+	while ((ret = ftruncate(fd, size)) == EINTR) {
+		// No-op
+	}
+	if (ret < 0) {
+		close(fd);
+		fprintf(stderr, "ftruncate failed\n");
+		return NULL;
+	}
+
+	void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (data == MAP_FAILED) {
+		fprintf(stderr, "mmap failed: %m\n");
+		close(fd);
+		return NULL;
+	}
+
+	struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
+	close(fd);
+	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height,
+		stride, fmt);
+	wl_shm_pool_destroy(pool);
+
+	*data_out = data;
+	return buffer;
+}
+
+static cairo_surface_t *apply_effects(cairo_surface_t *image, struct swaylock_state *state, int scale) {
+	if (state->args.effects_count == 0) {
+		return image;
+	}
+
+	if (state->args.time_effects) {
+		return swaylock_effects_run_timed(
+				image, scale,
+				state->args.effects, state->args.effects_count);
+	} else {
+		return swaylock_effects_run(
+				image, scale,
+				state->args.effects, state->args.effects_count);
+	}
+}
+
+static void handle_screencopy_frame_buffer(void *data,
+		struct zwlr_screencopy_frame_v1 *frame, uint32_t format, uint32_t width,
+		uint32_t height, uint32_t stride) {
+	swaylock_trace();
+	struct swaylock_surface *surface = data;
+
+	struct swaylock_image *image = calloc(1, sizeof(struct swaylock_image));
+	image->path = NULL;
+	image->output_name = surface->output_name;
+
+	void *bufdata;
+	struct wl_buffer *buf = create_shm_buffer(surface->state->shm, format, width, height, stride, &bufdata);
+	if (buf == NULL) {
+		free(image);
+		return;
+	}
+
+	surface->screencopy.format = format;
+	surface->screencopy.width = width;
+	surface->screencopy.height = height;
+	surface->screencopy.stride = stride;
+
+	surface->screencopy.image = image;
+	surface->screencopy.data = bufdata;
+
+	zwlr_screencopy_frame_v1_copy(frame, buf);
+}
+
+static void handle_screencopy_frame_flags(void *data,
+		struct zwlr_screencopy_frame_v1 *frame, uint32_t flags) {
+	swaylock_trace();
+	struct swaylock_surface *surface = data;
+
+	// The transform affecting a screenshot consists of three parts:
+	// Whether it's flipped vertically, whether it's flipped horizontally,
+	// and the four rotation options (0, 90, 180, 270).
+	// Any of the combinations of vertical flips, horizontal flips and rotation,
+	// can be expressed in terms of only horizontal flips and rotation
+	// (which is what the enum wl_output_transform encodes).
+	// Therefore, instead of inverting the Y axis or keeping around the
+	// "was it vertically flipped?" bit, we just map our state space onto the
+	// state space encoded by wl_output_transform and let load_background_from_buffer
+	// handle the rest.
+	if (flags & ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT) {
+		switch (surface->transform) {
+		case WL_OUTPUT_TRANSFORM_NORMAL:
+			surface->screencopy.transform = WL_OUTPUT_TRANSFORM_FLIPPED_180;
+			break;
+		case WL_OUTPUT_TRANSFORM_90:
+			surface->screencopy.transform = WL_OUTPUT_TRANSFORM_FLIPPED_90;
+			break;
+		case WL_OUTPUT_TRANSFORM_180:
+			surface->screencopy.transform = WL_OUTPUT_TRANSFORM_FLIPPED;
+			break;
+		case WL_OUTPUT_TRANSFORM_270:
+			surface->screencopy.transform = WL_OUTPUT_TRANSFORM_FLIPPED_270;
+			break;
+		case WL_OUTPUT_TRANSFORM_FLIPPED:
+			surface->screencopy.transform = WL_OUTPUT_TRANSFORM_180;
+			break;
+		case WL_OUTPUT_TRANSFORM_FLIPPED_90:
+			surface->screencopy.transform = WL_OUTPUT_TRANSFORM_90;
+			break;
+		case WL_OUTPUT_TRANSFORM_FLIPPED_180:
+			surface->screencopy.transform = WL_OUTPUT_TRANSFORM_NORMAL;
+			break;
+		case WL_OUTPUT_TRANSFORM_FLIPPED_270:
+			surface->screencopy.transform = WL_OUTPUT_TRANSFORM_270;
+			break;
+		}
+	} else {
+		surface->screencopy.transform = surface->transform;
+	}
+}
+
+static void handle_screencopy_frame_ready(void *data,
+		struct zwlr_screencopy_frame_v1 *frame, uint32_t tv_sec_hi,
+		uint32_t tv_sec_lo, uint32_t tv_nsec) {
+	swaylock_trace();
+	struct swaylock_surface *surface = data;
+	struct swaylock_state *state = surface->state;
+
+	cairo_surface_t *image = load_background_from_buffer(
+			surface->screencopy.data,
+			surface->screencopy.format,
+			surface->screencopy.width,
+			surface->screencopy.height,
+			surface->screencopy.stride,
+			surface->screencopy.transform);
+	if (image == NULL) {
+		swaylock_log(LOG_ERROR, "Failed to create image from screenshot");
+		state->args.screenshots = false;
+		state->args.fade_in = 0; // Fade in is not possible without screenshot
+	} else  {
+		surface->screencopy.original_image = cairo_surface_duplicate(image);
+		surface->screencopy.image->cairo_surface = image;
+		if (state->args.screenshots) {
+			swaylock_log(LOG_DEBUG, "Loaded screenshot for output %s", surface->output_name);
+			wl_list_insert(&state->images, &surface->screencopy.image->link);
+		}
+	}
+
+	--surface->events_pending;
+}
+
+static void handle_screencopy_frame_failed(void *data,
+		struct zwlr_screencopy_frame_v1 *frame) {
+	swaylock_trace();
+	struct swaylock_surface *surface = data;
+	swaylock_log(LOG_ERROR, "Screencopy failed");
+	surface->state->args.screenshots = false;
+	surface->state->args.fade_in = 0; // Fade in is not possible without screenshot
+
+	--surface->events_pending;
+}
+
+static const struct zwlr_screencopy_frame_v1_listener screencopy_frame_listener = {
+	.buffer = handle_screencopy_frame_buffer,
+	.flags = handle_screencopy_frame_flags,
+	.ready = handle_screencopy_frame_ready,
+	.failed = handle_screencopy_frame_failed,
+};
+
 static void handle_wl_output_name(void *data, struct wl_output *output,
 		const char *name) {
+	swaylock_trace();
+	swaylock_log(LOG_DEBUG, "output name is %s", name);
 	struct swaylock_surface *surface = data;
 	surface->output_name = strdup(name);
 }
@@ -250,6 +627,7 @@ static const struct ext_session_lock_v1_listener ext_session_lock_v1_listener = 
 
 static void handle_global(void *data, struct wl_registry *registry,
 		uint32_t name, const char *interface, uint32_t version) {
+
 	struct swaylock_state *state = data;
 	if (strcmp(interface, wl_compositor_interface.name) == 0) {
 		state->compositor = wl_registry_bind(registry, name,
@@ -276,6 +654,9 @@ static void handle_global(void *data, struct wl_registry *registry,
 		surface->output_global_name = name;
 		wl_output_add_listener(surface->output, &_wl_output_listener, surface);
 		wl_list_insert(&state->surfaces, &surface->link);
+	} else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
+		state->screencopy_manager = wl_registry_bind(registry, name,
+				&zwlr_screencopy_manager_v1_interface, 1);
 	} else if (strcmp(interface, ext_session_lock_manager_v1_interface.name) == 0) {
 		state->ext_session_lock_manager_v1 = wl_registry_bind(registry, name,
 				&ext_session_lock_manager_v1_interface, 1);
@@ -391,6 +772,7 @@ static void load_image(char *arg, struct swaylock_state *state) {
 		free(image);
 		return;
 	}
+
 	wl_list_insert(&state->images, &image->link);
 	swaylock_log(LOG_DEBUG, "Loaded image %s for output %s", image->path,
 			image->output_name ? image->output_name : "*");
@@ -455,6 +837,7 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 		LO_IND_X_POSITION,
 		LO_IND_Y_POSITION,
 		LO_IND_THICKNESS,
+		LO_IND_IMAGE,
 		LO_INSIDE_COLOR,
 		LO_INSIDE_CLEAR_COLOR,
 		LO_INSIDE_CAPS_LOCK_COLOR,
@@ -476,27 +859,50 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 		LO_RING_WRONG_COLOR,
 		LO_SEP_COLOR,
 		LO_TEXT_COLOR,
+		LO_TEXT_CLEAR,
 		LO_TEXT_CLEAR_COLOR,
+		LO_TEXT_CAPS_LOCK,
 		LO_TEXT_CAPS_LOCK_COLOR,
+		LO_TEXT_VER,
 		LO_TEXT_VER_COLOR,
+		LO_TEXT_WRONG,
 		LO_TEXT_WRONG_COLOR,
+		LO_EFFECT_BLUR,
+		LO_EFFECT_PIXELATE,
+		LO_EFFECT_SCALE,
+		LO_EFFECT_GREYSCALE,
+		LO_EFFECT_VIGNETTE,
+		LO_EFFECT_COMPOSE,
+		LO_EFFECT_CUSTOM,
+		LO_TIME_EFFECTS,
+		LO_INDICATOR,
+		LO_CLOCK,
+		LO_TIMESTR,
+		LO_DATESTR,
+		LO_FADE_IN,
+		LO_SUBMIT_ON_TOUCH,
+		LO_GRACE,
+		LO_GRACE_NO_MOUSE,
+		LO_GRACE_NO_TOUCH,
 	};
 
 	static struct option long_options[] = {
 		{"config", required_argument, NULL, 'C'},
 		{"color", required_argument, NULL, 'c'},
 		{"debug", no_argument, NULL, 'd'},
+		{"trace", no_argument, NULL, 't'},
 		{"ignore-empty-password", no_argument, NULL, 'e'},
 		{"daemonize", no_argument, NULL, 'f'},
 		{"ready-fd", required_argument, NULL, 'R'},
 		{"help", no_argument, NULL, 'h'},
 		{"image", required_argument, NULL, 'i'},
+		{"screenshots", no_argument, NULL, 'S'},
 		{"disable-caps-lock-text", no_argument, NULL, 'L'},
 		{"indicator-caps-lock", no_argument, NULL, 'l'},
 		{"line-uses-inside", no_argument, NULL, 'n'},
 		{"line-uses-ring", no_argument, NULL, 'r'},
 		{"scaling", required_argument, NULL, 's'},
-		{"tiling", no_argument, NULL, 't'},
+		{"tiling", no_argument, NULL, 'T'},
 		{"no-unlock-indicator", no_argument, NULL, 'u'},
 		{"show-keyboard-layout", no_argument, NULL, 'k'},
 		{"hide-keyboard-layout", no_argument, NULL, 'K'},
@@ -512,6 +918,7 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 		{"indicator-thickness", required_argument, NULL, LO_IND_THICKNESS},
 		{"indicator-x-position", required_argument, NULL, LO_IND_X_POSITION},
 		{"indicator-y-position", required_argument, NULL, LO_IND_Y_POSITION},
+		{"indicator-image", required_argument, NULL, LO_IND_IMAGE},
 		{"inside-color", required_argument, NULL, LO_INSIDE_COLOR},
 		{"inside-clear-color", required_argument, NULL, LO_INSIDE_CLEAR_COLOR},
 		{"inside-caps-lock-color", required_argument, NULL, LO_INSIDE_CAPS_LOCK_COLOR},
@@ -533,10 +940,31 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 		{"ring-wrong-color", required_argument, NULL, LO_RING_WRONG_COLOR},
 		{"separator-color", required_argument, NULL, LO_SEP_COLOR},
 		{"text-color", required_argument, NULL, LO_TEXT_COLOR},
+		{"text-clear", required_argument, NULL, LO_TEXT_CLEAR},
 		{"text-clear-color", required_argument, NULL, LO_TEXT_CLEAR_COLOR},
+		{"text-caps-lock", required_argument, NULL, LO_TEXT_CAPS_LOCK},
 		{"text-caps-lock-color", required_argument, NULL, LO_TEXT_CAPS_LOCK_COLOR},
+		{"text-ver", required_argument, NULL, LO_TEXT_VER},
 		{"text-ver-color", required_argument, NULL, LO_TEXT_VER_COLOR},
+		{"text-wrong", required_argument, NULL, LO_TEXT_WRONG},
 		{"text-wrong-color", required_argument, NULL, LO_TEXT_WRONG_COLOR},
+		{"effect-blur", required_argument, NULL, LO_EFFECT_BLUR},
+		{"effect-pixelate", required_argument, NULL, LO_EFFECT_PIXELATE},
+		{"effect-scale", required_argument, NULL, LO_EFFECT_SCALE},
+		{"effect-greyscale", no_argument, NULL, LO_EFFECT_GREYSCALE},
+		{"effect-vignette", required_argument, NULL, LO_EFFECT_VIGNETTE},
+		{"effect-compose", required_argument, NULL, LO_EFFECT_COMPOSE},
+		{"effect-custom", required_argument, NULL, LO_EFFECT_CUSTOM},
+		{"time-effects", no_argument, NULL, LO_TIME_EFFECTS},
+		{"indicator", no_argument, NULL, LO_INDICATOR},
+		{"clock", no_argument, NULL, LO_CLOCK},
+		{"timestr", required_argument, NULL, LO_TIMESTR},
+		{"datestr", required_argument, NULL, LO_DATESTR},
+		{"fade-in", required_argument, NULL, LO_FADE_IN},
+		{"submit-on-touch", no_argument, NULL, LO_SUBMIT_ON_TOUCH},
+		{"grace", required_argument, NULL, LO_GRACE},
+		{"grace-no-mouse", no_argument, NULL, LO_GRACE_NO_MOUSE},
+		{"grace-no-touch", no_argument, NULL, LO_GRACE_NO_TOUCH},
 		{0, 0, 0, 0}
 	};
 
@@ -549,6 +977,8 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 			"Turn the screen into the given color instead of white.\n"
 		"  -d, --debug                      "
 			"Enable debugging output.\n"
+		"  -t, --trace                      "
+			"Enable tracing output.\n"
 		"  -e, --ignore-empty-password      "
 			"When an empty password is provided, do not validate it.\n"
 		"  -F, --show-failed-attempts       "
@@ -557,10 +987,22 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 			"Detach from the controlling terminal after locking.\n"
 		"  -R, --ready-fd <fd>              "
 			"File descriptor to send readiness notifications to.\n"
+		"  --fade-in <seconds>              "
+			"Make the lock screen fade in instead of just popping in.\n"
+		"  --submit-on-touch                "
+			"Submit password in response to a touch event.\n"
+		"  --grace <seconds>                "
+			"Password grace period. Don't require the password for the first N seconds.\n"
+		"  --grace-no-mouse                 "
+			"During the grace period, don't unlock on a mouse event.\n"
+		"  --grace-no-touch                 "
+			"During the grace period, don't unlock on a touch event.\n"
 		"  -h, --help                       "
 			"Show help message and quit.\n"
 		"  -i, --image [[<output>]:]<path>  "
 			"Display the given image, optionally only on the given output.\n"
+		"  -S, --screenshots                "
+			"Use a screenshots as the background image.\n"
 		"  -k, --show-keyboard-layout       "
 			"Display the current xkb layout while typing.\n"
 		"  -K, --hide-keyboard-layout       "
@@ -571,10 +1013,18 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 			"Show the current Caps Lock state also on the indicator.\n"
 		"  -s, --scaling <mode>             "
 			"Image scaling mode: stretch, fill, fit, center, tile, solid_color.\n"
-		"  -t, --tiling                     "
+		"  -T, --tiling                     "
 			"Same as --scaling=tile.\n"
 		"  -u, --no-unlock-indicator        "
 			"Disable the unlock indicator.\n"
+		"  --indicator                      "
+			"Always show the indicator.\n"
+		"  --clock                          "
+			"Show time and date.\n"
+		"  --timestr <format>               "
+			"The format string for the time. Defaults to '%T'.\n"
+		"  --datestr <format>               "
+			"The format string for the date. Defaults to '%a, %x'.\n"
 		"  -v, --version                    "
 			"Show the version number and quit.\n"
 		"  --bs-hl-color <color>            "
@@ -599,6 +1049,8 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 			"Sets the horizontal position of the indicator.\n"
 		"  --indicator-y-position <y>       "
 			"Sets the vertical position of the indicator.\n"
+		"  --indicator-image <path>         "
+			"Display the given image inside of the indicator.\n"
 		"  --inside-color <color>           "
 			"Sets the color of the inside of the indicator.\n"
 		"  --inside-clear-color <color>     "
@@ -659,6 +1111,20 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 			"Sets the color of the text when verifying.\n"
 		"  --text-wrong-color <color>       "
 			"Sets the color of the text when invalid.\n"
+		"  --effect-blur <radius>x<times>   "
+			"Blur images.\n"
+		"  --effect-pixelate <factor>       "
+			"Pixelate images.\n"
+		"  --effect-scale <scale>           "
+			"Scale images.\n"
+		"  --effect-greyscale               "
+			"Make images greyscale.\n"
+		"  --effect-vignette <base>:<factor>"
+			"Apply a vignette effect to images. Base and factor should be numbers between 0 and 1.\n"
+		"  --effect-custom <path>           "
+			"Apply a custom effect from a shared object or C source file.\n"
+		"  --time-effects                   "
+			"Measure the time it takes to run each effect.\n"
 		"\n"
 		"All <color> options are of the form <rrggbb[aa]>.\n";
 
@@ -666,7 +1132,7 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 	optind = 1;
 	while (1) {
 		int opt_idx = 0;
-		c = getopt_long(argc, argv, "c:deFfhi:kKLlnrs:tuvC:R:", long_options,
+		c = getopt_long(argc, argv, "c:deFfhi:SkKLlnrs:tuvC:R:", long_options,
 				&opt_idx);
 		if (c == -1) {
 			break;
@@ -684,6 +1150,9 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 			break;
 		case 'd':
 			swaylock_log_init(LOG_DEBUG);
+			break;
+		case 't':
+			swaylock_log_init(LOG_TRACE);
 			break;
 		case 'e':
 			if (state) {
@@ -708,6 +1177,11 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 		case 'i':
 			if (state) {
 				load_image(optarg, state);
+			}
+			break;
+		case 'S':
+			if (state) {
+				state->args.screenshots = true;
 			}
 			break;
 		case 'k':
@@ -748,7 +1222,7 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 				}
 			}
 			break;
-		case 't':
+		case 'T':
 			if (state) {
 				state->args.mode = BACKGROUND_MODE_TILE;
 			}
@@ -813,6 +1287,11 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 			if (state) {
 				state->args.override_indicator_y_position = true;
 				state->args.indicator_y_position = atoi(optarg);
+			}
+			break;
+		case LO_IND_IMAGE:
+			if (state) {
+				state->indicator_image = load_background_image(optarg);
 			}
 			break;
 		case LO_INSIDE_COLOR:
@@ -920,9 +1399,21 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 				state->args.colors.text.input = parse_color(optarg);
 			}
 			break;
+		case LO_TEXT_CLEAR:
+			if (state) {
+				free(state->args.text_cleared);
+				state->args.text_cleared = strdup(optarg);
+			}
+			break;
 		case LO_TEXT_CLEAR_COLOR:
 			if (state) {
 				state->args.colors.text.cleared = parse_color(optarg);
+			}
+			break;
+		case LO_TEXT_CAPS_LOCK:
+			if (state) {
+				free(state->args.text_caps_lock);
+				state->args.text_caps_lock = strdup(optarg);
 			}
 			break;
 		case LO_TEXT_CAPS_LOCK_COLOR:
@@ -930,14 +1421,149 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 				state->args.colors.text.caps_lock = parse_color(optarg);
 			}
 			break;
+		case LO_TEXT_VER:
+			if (state) {
+				free(state->args.text_verifying);
+				state->args.text_verifying = strdup(optarg);
+			}
+			break;
 		case LO_TEXT_VER_COLOR:
 			if (state) {
 				state->args.colors.text.verifying = parse_color(optarg);
 			}
 			break;
+		case LO_TEXT_WRONG:
+			if (state) {
+				free(state->args.text_wrong);
+				state->args.text_wrong = strdup(optarg);
+			}
+			break;
 		case LO_TEXT_WRONG_COLOR:
 			if (state) {
 				state->args.colors.text.wrong = parse_color(optarg);
+			}
+			break;
+		case LO_EFFECT_BLUR:
+			if (state) {
+				state->args.effects = realloc(state->args.effects,
+						sizeof(*state->args.effects) * ++state->args.effects_count);
+				struct swaylock_effect *effect = &state->args.effects[state->args.effects_count - 1];
+				effect->tag = EFFECT_BLUR;
+				if (sscanf(optarg, "%dx%d", &effect->e.blur.radius, &effect->e.blur.times) != 2) {
+					swaylock_log(LOG_ERROR, "Invalid blur effect argument %s, ignoring", optarg);
+					state->args.effects_count -= 1;
+				}
+			}
+			break;
+		case LO_EFFECT_PIXELATE:
+			if (state) {
+				state->args.effects = realloc(state->args.effects,
+						sizeof(*state->args.effects) * ++state->args.effects_count);
+				struct swaylock_effect *effect = &state->args.effects[state->args.effects_count - 1];
+				effect->tag = EFFECT_PIXELATE;
+				effect->e.pixelate.factor = atoi(optarg);
+			}
+			break;
+		case LO_EFFECT_SCALE:
+			if (state) {
+				state->args.effects = realloc(state->args.effects,
+						sizeof(*state->args.effects) * ++state->args.effects_count);
+				struct swaylock_effect *effect = &state->args.effects[state->args.effects_count - 1];
+				effect->tag = EFFECT_SCALE;
+				if (sscanf(optarg, "%lf", &effect->e.scale) != 1) {
+					swaylock_log(LOG_ERROR, "Invalid scale effect argument %s, ignoring", optarg);
+					state->args.effects_count -= 1;
+				}
+			}
+			break;
+		case LO_EFFECT_GREYSCALE:
+			if (state) {
+				state->args.effects = realloc(state->args.effects,
+						sizeof(*state->args.effects) * ++state->args.effects_count);
+				struct swaylock_effect *effect = &state->args.effects[state->args.effects_count - 1];
+				effect->tag = EFFECT_GREYSCALE;
+			}
+			break;
+		case LO_EFFECT_VIGNETTE:
+			if (state) {
+				state->args.effects = realloc(state->args.effects,
+						sizeof(*state->args.effects) * ++state->args.effects_count);
+				struct swaylock_effect *effect = &state->args.effects[state->args.effects_count - 1];
+				effect->tag = EFFECT_VIGNETTE;
+				if (sscanf(optarg, "%lf:%lf", &effect->e.vignette.base, &effect->e.vignette.factor) != 2) {
+					swaylock_log(LOG_ERROR, "Invalid factor effect argument %s, ignoring", optarg);
+					state->args.effects_count -= 1;
+				}
+			}
+			break;
+		case LO_EFFECT_COMPOSE:
+			if (state) {
+				state->args.effects = realloc(state->args.effects,
+						sizeof(*state->args.effects) * ++state->args.effects_count);
+				struct swaylock_effect *effect = &state->args.effects[state->args.effects_count - 1];
+				effect->tag = EFFECT_COMPOSE;
+				parse_effect_compose(optarg, effect);
+			}
+			break;
+		case LO_EFFECT_CUSTOM:
+			if (state) {
+				state->args.effects = realloc(state->args.effects,
+						sizeof(*state->args.effects) * ++state->args.effects_count);
+				struct swaylock_effect *effect = &state->args.effects[state->args.effects_count - 1];
+				effect->tag = EFFECT_CUSTOM;
+				effect->e.custom = strdup(optarg);
+			}
+			break;
+		case LO_TIME_EFFECTS:
+			if (state) {
+				state->args.time_effects = true;
+			}
+			break;
+		case LO_INDICATOR:
+			if (state) {
+				state->args.indicator = true;
+			}
+			break;
+		case LO_CLOCK:
+			if (state) {
+				state->args.clock = true;
+			}
+			break;
+		case LO_TIMESTR:
+			if (state) {
+				free(state->args.timestr);
+				state->args.timestr = strdup(optarg);
+			}
+			break;
+		case LO_DATESTR:
+			if (state) {
+				free(state->args.datestr);
+				state->args.datestr = strdup(optarg);
+			}
+			break;
+		case LO_FADE_IN:
+			if (state) {
+				state->args.fade_in = parse_seconds(optarg);
+			}
+			break;
+		case LO_SUBMIT_ON_TOUCH:
+			if (state) {
+				state->args.password_submit_on_touch = true;
+			}
+			break;
+		case LO_GRACE:
+			if (state) {
+				state->args.password_grace_period = parse_seconds(optarg);
+			}
+			break;
+		case LO_GRACE_NO_MOUSE:
+			if (state) {
+				state->args.password_grace_no_mouse = true;
+			}
+			break;
+		case LO_GRACE_NO_TOUCH:
+			if (state) {
+				state->args.password_grace_no_touch = true;
 			}
 			break;
 		default:
@@ -1033,6 +1659,20 @@ static void display_in(int fd, short mask, void *data) {
 	}
 }
 
+static void end_allow_fade_period(void *data) {
+	struct swaylock_state *state = data;
+	if (state->args.allow_fade) {
+		state->args.allow_fade = false;
+	}
+}
+
+static void end_grace_period(void *data) {
+	struct swaylock_state *state = data;
+	if (state->auth_state == AUTH_STATE_GRACE) {
+		state->auth_state = AUTH_STATE_IDLE;
+	}
+}
+
 static void comm_in(int fd, short mask, void *data) {
 	if (mask & POLLIN) {
 		bool auth_success = false;
@@ -1052,6 +1692,12 @@ static void comm_in(int fd, short mask, void *data) {
 		swaylock_log(LOG_ERROR,	"Password checking subprocess crashed; exiting.");
 		exit(EXIT_FAILURE);
 	}
+}
+
+static void timer_render(void *data) {
+	struct swaylock_state *state = (struct swaylock_state *)data;
+	damage_state(state);
+	loop_add_timer(state->eventloop, 1000, timer_render, state);
 }
 
 static void term_in(int fd, short mask, void *data) {
@@ -1095,7 +1741,7 @@ int main(int argc, char **argv) {
 		.mode = BACKGROUND_MODE_FILL,
 		.font = strdup("sans-serif"),
 		.font_size = 0,
-		.radius = 50,
+		.radius = 75,
 		.thickness = 10,
 		.indicator_x_position = 0,
 		.indicator_y_position = 0,
@@ -1110,6 +1756,21 @@ int main(int argc, char **argv) {
 		.show_failed_attempts = false,
 		.indicator_idle_visible = false,
 		.ready_fd = -1,
+
+		.screenshots = false,
+		.effects = NULL,
+		.effects_count = 0,
+		.indicator = false,
+		.clock = false,
+		.timestr = strdup("%T"),
+		.datestr = strdup("%a, %x"),
+		.allow_fade = true,
+		.password_grace_period = 0,
+
+		.text_cleared = strdup("Cleared"),
+		.text_caps_lock = strdup("Caps Lock"),
+		.text_verifying = strdup("Verifying"),
+		.text_wrong = strdup("Wrong"),
 	};
 	wl_list_init(&state.images);
 	set_default_colors(&state.args.colors);
@@ -1147,6 +1808,10 @@ int main(int argc, char **argv) {
 		state.args.colors.line = state.args.colors.inside;
 	} else if (line_mode == LM_RING) {
 		state.args.colors.line = state.args.colors.ring;
+	}
+
+	if (state.args.password_grace_period > 0) {
+		state.auth_state = AUTH_STATE_GRACE;
 	}
 
 	state.password.len = 0;
@@ -1202,6 +1867,49 @@ int main(int argc, char **argv) {
 
 	if (!state.ext_session_lock_manager_v1) {
 		swaylock_log(LOG_ERROR, "Missing ext-session-lock-v1");
+        return 1;
+	}
+
+	struct swaylock_surface *surface;
+	// Enumerate all outputs first so that screenshots can be obtained
+	// before ext_session_lock_manager_v1_lock(). After the screen is locked,
+	// no screenshot can be retrieved because normal rendering is blocked.
+	wl_list_for_each(surface, &state.surfaces, link) {
+		surface->events_pending += 1;
+	};
+
+	wl_list_for_each(surface, &state.surfaces, link) {
+		while (surface->events_pending > 0) {
+			wl_display_roundtrip(state.display);
+		}
+	}
+
+	// Must daemonize before we run any effects, since effects use openmp
+	int daemonfd;
+	if (state.args.daemonize) {
+		wl_display_roundtrip(state.display);
+		daemonfd = daemonize_start();
+	}
+
+	// Need to apply effects to all images *before* requesting ext_session_lock_v1
+	// Otherwise, the screen would be blank while the effects are being applied.
+	struct swaylock_image *iter_image, *temp;
+	wl_list_for_each_safe(iter_image, temp, &state.images, link) {
+		iter_image->cairo_surface = apply_effects(
+				iter_image->cairo_surface, &state, 1);
+	}
+
+	if (state.ext_session_lock_manager_v1) {
+		swaylock_log(LOG_DEBUG, "Using ext-session-lock-v1");
+		state.ext_session_lock_v1 = ext_session_lock_manager_v1_lock(state.ext_session_lock_manager_v1);
+		ext_session_lock_v1_add_listener(state.ext_session_lock_v1,
+				&ext_session_lock_v1_listener, &state);
+	} else if (state.layer_shell && state.input_inhibit_manager) {
+		swaylock_log(LOG_DEBUG, "Using wlr-layer-shell + wlr-input-inhibitor");
+		zwlr_input_inhibit_manager_v1_get_inhibitor(state.input_inhibit_manager);
+	} else {
+		swaylock_log(LOG_ERROR, "Missing ext-session-lock-v1, wlr-layer-shell "
+				"and wlr-input-inhibitor");
 		return 1;
 	}
 
@@ -1217,7 +1925,6 @@ int main(int argc, char **argv) {
 	state.test_surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 1, 1);
 	state.test_cairo = cairo_create(state.test_surface);
 
-	struct swaylock_surface *surface;
 	wl_list_for_each(surface, &state.surfaces, link) {
 		create_surface(surface);
 	}
@@ -1239,6 +1946,12 @@ int main(int argc, char **argv) {
 	}
 	if (state.args.daemonize) {
 		daemonize();
+    }
+    
+	wl_list_for_each(surface, &state.surfaces, link) {
+		while (surface->events_pending > 0) {
+			wl_display_roundtrip(state.display);
+		}
 	}
 
 	loop_add_fd(state.eventloop, wl_display_get_fd(state.display), POLLIN,
@@ -1254,6 +1967,25 @@ int main(int argc, char **argv) {
 	sa.sa_flags = SA_RESTART;
 	sigaction(SIGUSR1, &sa, NULL);
 
+	loop_add_timer(state.eventloop, 1000, timer_render, &state);
+
+	if (state.args.fade_in) {
+		loop_add_timer(state.eventloop, state.args.fade_in, end_allow_fade_period, &state);
+	}
+
+	if (state.args.daemonize && state.args.fade_in) {
+		loop_add_timer(state.eventloop, state.args.fade_in + 500, daemonize_done, &daemonfd);
+	} else if (state.args.daemonize) {
+		daemonize_done(&daemonfd);
+	}
+
+	if (state.args.password_grace_period > 0) {
+		loop_add_timer(state.eventloop, state.args.password_grace_period, end_grace_period, &state);
+	}
+
+	// Re-draw once to start the draw loop
+	damage_state(&state);
+
 	state.run_display = true;
 	while (state.run_display) {
 		errno = 0;
@@ -1263,6 +1995,9 @@ int main(int argc, char **argv) {
 		loop_poll(state.eventloop);
 	}
 
+    if (state.args.daemonize && state.args.fade_in) {
+        daemonize_done(&daemonfd); // In case we exit before --fade-in timeout
+    }
 	ext_session_lock_v1_unlock_and_destroy(state.ext_session_lock_v1);
 	wl_display_roundtrip(state.display);
 

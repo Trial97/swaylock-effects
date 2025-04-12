@@ -27,23 +27,29 @@ if is_freebsd
 	add_project_arguments('-D_C11_SOURCE', language: 'c')
 endif
 
+if get_option('sse')
+	add_project_arguments('-DUSE_SSE', language: 'c')
+endif
+
 wayland_client = dependency('wayland-client', version: '>=1.20.0')
 wayland_protos = dependency('wayland-protocols', version: '>=1.25', fallback: 'wayland-protocols')
 wayland_scanner = dependency('wayland-scanner', version: '>=1.15.0', native: true)
 xkbcommon = dependency('xkbcommon')
 cairo = dependency('cairo')
+omp = dependency('openmp')
 gdk_pixbuf = dependency('gdk-pixbuf-2.0', required: get_option('gdk-pixbuf'))
 libpam = cc.find_library('pam', required: get_option('pam'))
 crypt = cc.find_library('crypt', required: not libpam.found())
 math = cc.find_library('m')
 rt = cc.find_library('rt')
+dl = cc.find_library('dl')
 
 git = find_program('git', required: false)
 scdoc = find_program('scdoc', required: get_option('man-pages'))
 wayland_scanner_prog = find_program(wayland_scanner.get_variable('wayland_scanner'), native: true)
 
 version = meson.project_version()
-if git.found()
+if git.found() and import('fs').is_dir('.git')
 	git_commit_hash = run_command([git, 'describe', '--always', '--tags'], check: false)
 	git_branch = run_command([git, 'rev-parse', '--abbrev-ref', 'HEAD'], check: false)
 	if git_commit_hash.returncode() == 0 and git_branch.returncode() == 0
@@ -67,6 +73,7 @@ wayland_scanner_client = generator(
 
 client_protocols = [
 	wl_protocol_dir / 'staging/ext-session-lock/ext-session-lock-v1.xml',
+	'wlr-screencopy-unstable-v1.xml',
 ]
 
 protos_src = []
@@ -87,8 +94,10 @@ dependencies = [
 	gdk_pixbuf,
 	math,
 	rt,
+	dl,
 	xkbcommon,
 	wayland_client,
+	omp
 ]
 
 sources = [
@@ -104,6 +113,8 @@ sources = [
 	'render.c',
 	'seat.c',
 	'unicode.c',
+	'effects.c',
+	'fade.c',
 ]
 
 if libpam.found()
