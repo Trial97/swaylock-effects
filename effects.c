@@ -1,4 +1,3 @@
-#define _POSIX_C_SOURCE 200809
 #define _XOPEN_SOURCE 700
 #include <omp.h>
 #include <limits.h>

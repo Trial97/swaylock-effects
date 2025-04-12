@@ -297,16 +297,7 @@ static void create_surface(struct swaylock_surface *surface) {
 		state->ext_session_lock_v1, surface->surface, surface->output);
 	ext_session_lock_surface_v1_add_listener(surface->ext_session_lock_surface_v1,
 		&ext_session_lock_surface_v1_listener, surface);
-    surface->events_pending += 1;
 
-
-	if (!state->ext_session_lock_v1) {
-		wl_surface_commit(surface->surface);
-	}
-}
-
-static void initially_render_surface(struct swaylock_surface *surface) {
-	swaylock_log(LOG_DEBUG, "Surface for output %s ready", surface->output_name);
 	if (surface_is_opaque(surface) &&
 			surface->state->args.mode != BACKGROUND_MODE_CENTER &&
 			surface->state->args.mode != BACKGROUND_MODE_FIT) {
@@ -317,24 +308,20 @@ static void initially_render_surface(struct swaylock_surface *surface) {
 		wl_region_destroy(region);
 	}
 
-	surface->created = true;
-    if (!surface->state->ext_session_lock_v1) {
-        render_frame_background(surface, true);
-		render_frame(surface);
+    surface->created = true;
+	if (!state->ext_session_lock_v1) {
+		wl_surface_commit(surface->surface);
 	}
 }
+
+
 static void ext_session_lock_surface_v1_handle_configure(void *data,
 		struct ext_session_lock_surface_v1 *lock_surface, uint32_t serial,
 		uint32_t width, uint32_t height) {
 	struct swaylock_surface *surface = data;
 	surface->width = width;
 	surface->height = height;
-    // Render before we send the ACK event, so that we minimize flickering
-	// This means we cannot commit immediately after rendering -- we will have
-	// to send the ACK first and then commit.
-	render_frame_background(surface, false);
 	ext_session_lock_surface_v1_ack_configure(lock_surface, serial);
-	wl_surface_commit(surface->surface);
 	surface->dirty = true;
 	render(surface);
 }
@@ -369,6 +356,8 @@ static void handle_wl_output_mode(void *data, struct wl_output *output,
 		uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
 	// Who cares
 }
+
+static const struct zwlr_screencopy_frame_v1_listener screencopy_frame_listener;
 
 static void handle_wl_output_done(void *data, struct wl_output *output) {
 	swaylock_trace();
@@ -1878,12 +1867,6 @@ int main(int argc, char **argv) {
 		surface->events_pending += 1;
 	};
 
-	wl_list_for_each(surface, &state.surfaces, link) {
-		while (surface->events_pending > 0) {
-			wl_display_roundtrip(state.display);
-		}
-	}
-
 	// Must daemonize before we run any effects, since effects use openmp
 	int daemonfd;
 	if (state.args.daemonize) {
@@ -1897,20 +1880,6 @@ int main(int argc, char **argv) {
 	wl_list_for_each_safe(iter_image, temp, &state.images, link) {
 		iter_image->cairo_surface = apply_effects(
 				iter_image->cairo_surface, &state, 1);
-	}
-
-	if (state.ext_session_lock_manager_v1) {
-		swaylock_log(LOG_DEBUG, "Using ext-session-lock-v1");
-		state.ext_session_lock_v1 = ext_session_lock_manager_v1_lock(state.ext_session_lock_manager_v1);
-		ext_session_lock_v1_add_listener(state.ext_session_lock_v1,
-				&ext_session_lock_v1_listener, &state);
-	} else if (state.layer_shell && state.input_inhibit_manager) {
-		swaylock_log(LOG_DEBUG, "Using wlr-layer-shell + wlr-input-inhibitor");
-		zwlr_input_inhibit_manager_v1_get_inhibitor(state.input_inhibit_manager);
-	} else {
-		swaylock_log(LOG_ERROR, "Missing ext-session-lock-v1, wlr-layer-shell "
-				"and wlr-input-inhibitor");
-		return 1;
 	}
 
 	state.ext_session_lock_v1 = ext_session_lock_manager_v1_lock(state.ext_session_lock_manager_v1);
@@ -1928,6 +1897,13 @@ int main(int argc, char **argv) {
 	wl_list_for_each(surface, &state.surfaces, link) {
 		create_surface(surface);
 	}
+    
+    wl_list_for_each(surface, &state.surfaces, link) {
+        while (surface->events_pending > 0) {
+            wl_display_roundtrip(state.display);
+        }
+    }
+	swaylock_log(LOG_DEBUG, "create_surface pw check request");
 
 	while (!state.locked) {
 		if (wl_display_dispatch(state.display) < 0) {
@@ -1944,16 +1920,7 @@ int main(int argc, char **argv) {
 		close(state.args.ready_fd);
 		state.args.ready_fd = -1;
 	}
-	if (state.args.daemonize) {
-		daemonize();
-    }
     
-	wl_list_for_each(surface, &state.surfaces, link) {
-		while (surface->events_pending > 0) {
-			wl_display_roundtrip(state.display);
-		}
-	}
-
 	loop_add_fd(state.eventloop, wl_display_get_fd(state.display), POLLIN,
 			display_in, NULL);
 

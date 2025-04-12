@@ -147,6 +147,7 @@ struct swaylock_surface {
   struct wl_surface *surface; // surface for background
   struct wl_surface *child;   // indicator surface made into subsurface
   struct wl_subsurface *subsurface;
+  struct zwlr_screencopy_frame_v1 *screencopy_frame;
   struct ext_session_lock_surface_v1 *ext_session_lock_surface_v1;
   struct pool_buffer indicator_buffers[2];
   bool created;

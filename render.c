@@ -161,9 +161,7 @@ void render(struct swaylock_surface *surface) {
 	surface->dirty = false;
 	surface->frame = wl_surface_frame(surface->surface);
 	wl_callback_add_listener(surface->frame, &surface_frame_listener, surface);
-	if (commit) {
-        wl_surface_commit(surface->surface);
-	}
+    wl_surface_commit(surface->surface);
 
 	if (need_destroy) {
 		destroy_buffer(&buffer);
@@ -177,8 +175,7 @@ void render_background_fade(struct swaylock_surface *surface, uint32_t time) {
 
 	fade_update(&surface->fade, time);
 
-	render_frame_background(surface, true);
-	render_frame(surface);
+	render(surface);
 }
 
 static void configure_font_drawing(cairo_t *cairo, struct swaylock_state *state,
@@ -210,7 +207,7 @@ static bool render_frame(struct swaylock_surface *surface) {
     char *text_l1 = NULL;
     char *text_l2 = NULL;
 	const char *layout_text = NULL;
-    double font_size;
+    double font_size = 0;
 
 	bool draw_indicator = state->args.show_indicator &&
 		(state->auth_state != AUTH_STATE_IDLE ||
@@ -222,7 +219,7 @@ static bool render_frame(struct swaylock_surface *surface) {
 			// This message has highest priority
 			text = state->args.text_cleared;
 		} else if (state->auth_state == AUTH_STATE_VALIDATING) {
-			text = state->args.text_verifyin;
+			text = state->args.text_verifying;
 		} else if (state->auth_state == AUTH_STATE_INVALID) {
 			text = state->args.text_wrong;
 		} else {
@@ -260,10 +257,10 @@ static bool render_frame(struct swaylock_surface *surface) {
 		}
 	}
 
-    if (text_l1 && !text_l2)
-        text = text_l1;
-    if (text_l2 && !text_l1)
-        text = text_l2;
+	if (text_l1 && !text_l2)
+		text = text_l1;
+	if (text_l2 && !text_l1)
+		text = text_l2;
 
 	// Compute the size of the buffer needed
 	int arc_radius = state->args.radius * surface->scale;
@@ -301,40 +298,41 @@ static bool render_frame(struct swaylock_surface *surface) {
 
         /* Top */
 
-        cairo_text_extents(cairo, text_l1, &extents_l1);
-        cairo_font_extents(cairo, &fe_l1);
+        cairo_text_extents(state->test_cairo, text_l1, &extents_l1);
+        cairo_font_extents(state->test_cairo, &fe_l1);
         x_l1 = (buffer_width / 2) -
             (extents_l1.width / 2 + extents_l1.x_bearing);
         y_l1 = (buffer_diameter / 2) +
             (fe_l1.height / 2 - fe_l1.descent) - arc_radius / 10.0f;
 
-        cairo_move_to(cairo, x_l1, y_l1);
-        cairo_show_text(cairo, text_l1);
-        cairo_close_path(cairo);
-        cairo_new_sub_path(cairo);
+        cairo_move_to(state->test_cairo, x_l1, y_l1);
+        cairo_show_text(state->test_cairo, text_l1);
+        cairo_close_path(state->test_cairo);
+        cairo_new_sub_path(state->test_cairo);
 
         /* Bottom */
 
-        cairo_set_font_size(cairo, arc_radius / 6.0f);
-        cairo_text_extents(cairo, text_l2, &extents_l2);
-        cairo_font_extents(cairo, &fe_l2);
+        cairo_set_font_size(state->test_cairo, arc_radius / 6.0f);
+        cairo_text_extents(state->test_cairo, text_l2, &extents_l2);
+        cairo_font_extents(state->test_cairo, &fe_l2);
         x_l2 = (buffer_width / 2) -
             (extents_l2.width / 2 + extents_l2.x_bearing);
         y_l2 = (buffer_diameter / 2) +
             (fe_l2.height / 2 - fe_l2.descent) + arc_radius / 3.5f;
 
-        cairo_move_to(cairo, x_l2, y_l2);
-        cairo_show_text(cairo, text_l2);
-        cairo_close_path(cairo);
-        cairo_new_sub_path(cairo);
+        cairo_move_to(state->test_cairo, x_l2, y_l2);
+        cairo_show_text(state->test_cairo, text_l2);
+        cairo_close_path(state->test_cairo);
+        cairo_new_sub_path(state->test_cairo);
 
-        if (new_width < extents_l1.width)
-            new_width = extents_l1.width;
-        if (new_width < extents_l2.width)
-            new_width = extents_l2.width;
+        double box_padding = 4.0 * surface->scale;
+        if (buffer_width < extents_l1.width + 2 * box_padding)
+            buffer_width = extents_l1.width + 2 * box_padding;
+        if (buffer_width < extents_l2.width + 2 * box_padding)
+            buffer_width = extents_l2.width + 2 * box_padding;
 
 
-        cairo_set_font_size(cairo, font_size);
+        cairo_set_font_size(state->test_cairo, font_size);
 	}
 	// Ensure buffer size is multiple of buffer scale - required by protocol
 	buffer_height += surface->scale - (buffer_height % surface->scale);
